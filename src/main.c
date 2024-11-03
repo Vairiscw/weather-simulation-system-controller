@@ -7,14 +7,18 @@
 #include "esp_http_client.h"
 #include "driver/gpio.h"
 
-#define RELAY_GPIO_PIN  2 // Пин для управления реле
+#define FAN_GPIO_PIN  2 // Пин для управления реле
+#define HUMID_GPIO_PIN  4 // Пин для управления реле
+#define FRESH_GPIO_PIN  16 // Пин для управления реле
 
 static const char *TAG = "ESP32_HTTP_CLIENT";
 
-#define WIFI_SSID      "wifi_ssid"
-#define WIFI_PASS      "wifi_pass"
+#define WIFI_SSID      "ssid"
+#define WIFI_PASS      "pass"
 #define MAX_RETRY      5
 static char* SERVER_URL  =   "server_url";
+
+#define FULL_URL_SIZE 128
 
 static char response_buffer[1024]; // Буфер для хранения ответа
 static bool response_received = false;
@@ -118,52 +122,112 @@ void wifi_init_sta(void)
     vEventGroupDelete(s_wifi_event_group);
 }
 
-static void relay_control(bool state) {
-    gpio_set_level(RELAY_GPIO_PIN, state ? 1 : 0);
+static void fan_control(bool state) {
+    gpio_set_level(FAN_GPIO_PIN, state ? 1 : 0);
 }
+
+static void humid_control(bool state) {
+    gpio_set_level(HUMID_GPIO_PIN, state ? 1 : 0);
+}
+
+static void fresh_control(bool state) {
+    gpio_set_level(FRESH_GPIO_PIN, state ? 1 : 0);
+}
+
 
 esp_err_t _http_event_handler(esp_http_client_event_t *evt) {
     if (evt->event_id == HTTP_EVENT_ON_DATA) {
-        if (!esp_http_client_is_chunked_response(evt->client)) {
-                if (evt->data_len < sizeof(response_buffer) - 1) {
-                    strncpy(response_buffer, (char*)evt->data, evt->data_len);
-                    response_buffer[evt->data_len] = 0; // Null-terminate the string
-                    response_received = true;
-                }
-            }
+        if (evt->data_len < sizeof(response_buffer) - 1) {
+            strncpy(response_buffer, (char*)evt->data, evt->data_len);
+            response_buffer[evt->data_len] = 0; // Завершаем строку нулевым символом
+            response_received = true;
+        }
     }
     return ESP_OK;
 }
 
+static void get_fan_status_from_server(void *pvParameters) {
+    char url_buffer[FULL_URL_SIZE];  // Создаем отдельный буфер для полного URL
 
-static void get_relay_status_from_server(void *pvParameters) {
+    // Формируем полный URL для запроса состояния реле
+    snprintf(url_buffer, sizeof(url_buffer), "%s/devices/fan", SERVER_URL);
     esp_http_client_config_t config = {
-        .url = strcat(SERVER_URL, "relay"),
+        .url = url_buffer,
         .event_handler = _http_event_handler,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
 
     while (1) {
-        esp_http_client_set_url(client, strcat(SERVER_URL, "relay/state"));
-        esp_http_client_set_method(client, HTTP_METHOD_GET);
         esp_err_t err = esp_http_client_perform(client);
-
-        if (err == ESP_OK) {
-            int status_code = esp_http_client_get_status_code(client);
-            if (status_code == 200) {
-               
-                char response[10];
-                int content_length = esp_http_client_get_content_length(client);
-                esp_http_client_read(client, response, content_length);
-                bool relay_state = strcmp(response_buffer, "off") == 0;
-                relay_control(relay_state);
-                response[content_length] = 0;
-            }
+        if (err == ESP_OK && response_received) {
+            ESP_LOGI(TAG, "Fan: Response: %s", response_buffer);
+            bool relay_state = strcmp(response_buffer, "1") == 0;
+            fan_control(relay_state);
         } else {
-            
+            ESP_LOGE(TAG, "Fan: HTTP GET request failed: %s", esp_err_to_name(err));
         }
+        
+        response_received = false;
+        memset(response_buffer, 0, sizeof(response_buffer)); // Очистка буфера
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
 
-        vTaskDelay(500 / portTICK_PERIOD_MS);
+    esp_http_client_cleanup(client);
+}
+
+static void get_humid_status_from_server(void *pvParameters) {
+    char url_buffer[FULL_URL_SIZE];  // Создаем отдельный буфер для полного URL
+
+    // Формируем полный URL для запроса состояния реле
+    snprintf(url_buffer, sizeof(url_buffer), "%s/devices/humidifier", SERVER_URL);
+    esp_http_client_config_t config = {
+        .url = url_buffer,
+        .event_handler = _http_event_handler,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+
+    while (1) {
+        esp_err_t err = esp_http_client_perform(client);
+        if (err == ESP_OK && response_received) {
+            ESP_LOGI(TAG, "Humid: Response: %s", response_buffer);
+            bool relay_state = strcmp(response_buffer, "1") == 0;
+            humid_control(relay_state);
+        } else {
+            ESP_LOGE(TAG, "Humid: HTTP GET request failed: %s", esp_err_to_name(err));
+        }
+        
+        response_received = false;
+        memset(response_buffer, 0, sizeof(response_buffer)); // Очистка буфера
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+
+    esp_http_client_cleanup(client);
+}
+
+static void get_fresh_status_from_server(void *pvParameters) {
+    char url_buffer[FULL_URL_SIZE];  // Создаем отдельный буфер для полного URL
+
+    // Формируем полный URL для запроса состояния реле
+    snprintf(url_buffer, sizeof(url_buffer), "%s/devices/freshener", SERVER_URL);
+    esp_http_client_config_t config = {
+        .url = url_buffer,
+        .event_handler = _http_event_handler,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+
+    while (1) {
+        esp_err_t err = esp_http_client_perform(client);
+        if (err == ESP_OK && response_received) {
+            ESP_LOGI(TAG, "Fresh: Response: %s", response_buffer);
+            bool relay_state = strcmp(response_buffer, "1") == 0;
+            fresh_control(relay_state);
+        } else {
+            ESP_LOGE(TAG, "Fresh: HTTP GET request failed: %s", esp_err_to_name(err));
+        }
+        
+        response_received = false;
+        memset(response_buffer, 0, sizeof(response_buffer)); // Очистка буфера
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 
     esp_http_client_cleanup(client);
@@ -175,8 +239,14 @@ void app_main() {
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     wifi_init_sta(); // Функция для инициализации Wi-Fi
 
-    esp_rom_gpio_pad_select_gpio(RELAY_GPIO_PIN);
-    gpio_set_direction(RELAY_GPIO_PIN, GPIO_MODE_OUTPUT);
+    esp_rom_gpio_pad_select_gpio(FAN_GPIO_PIN);
+    gpio_set_direction(FAN_GPIO_PIN, GPIO_MODE_OUTPUT);
+    esp_rom_gpio_pad_select_gpio(HUMID_GPIO_PIN);
+    gpio_set_direction(HUMID_GPIO_PIN, GPIO_MODE_OUTPUT);
+    esp_rom_gpio_pad_select_gpio(FRESH_GPIO_PIN);
+    gpio_set_direction(FRESH_GPIO_PIN, GPIO_MODE_OUTPUT);
 
-    xTaskCreate(&get_relay_status_from_server, "http_request_task", 8192, NULL, 5, NULL);
+    xTaskCreate(&get_fan_status_from_server, "http_request_task", 8192, NULL, 5, NULL);
+    xTaskCreate(&get_humid_status_from_server, "http_request_task", 8192, NULL, 5, NULL);
+    xTaskCreate(&get_fresh_status_from_server, "http_request_task", 8192, NULL, 5, NULL);
 }
