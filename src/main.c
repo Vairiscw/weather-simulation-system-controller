@@ -10,18 +10,25 @@
 #define FAN_GPIO_PIN  2 // Пин для управления реле
 #define HUMID_GPIO_PIN  4 // Пин для управления реле
 #define FRESH_GPIO_PIN  16 // Пин для управления реле
+#define FRESH2_GPIO_PIN 17
+#define LIMIT_SWITCH_PIN 5 // Пин для концевика
 
 static const char *TAG = "ESP32_HTTP_CLIENT";
 
-#define WIFI_SSID      "ssid"
-#define WIFI_PASS      "pass"
+#define WIFI_SSID      "SamsungA422_2G"
+#define WIFI_PASS      "samsunghack"
 #define MAX_RETRY      5
-static char* SERVER_URL  =   "server_url";
+// static char* SERVER_URL  =   "http://192.168.1.46:9898";
 
 #define FULL_URL_SIZE 128
 
-static char response_buffer[1024]; // Буфер для хранения ответа
-static bool response_received = false;
+typedef struct {
+    char url[FULL_URL_SIZE];
+    char response_buffer[1024]; // Буфер для хранения ответа
+    bool response_received;
+} http_task;
+
+static bool limit_status;
 
 static int s_retry_num = 0;
 static EventGroupHandle_t s_wifi_event_group;
@@ -31,6 +38,10 @@ static EventGroupHandle_t s_wifi_event_group;
  * - we failed to connect after the maximum amount of retries */
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
+
+static void freshener_timer() {
+    vTaskDelay(1800000 / portTICK_PERIOD_MS);
+}
 
 static void event_handler(void* arg, esp_event_base_t event_base,
                           int32_t event_id, void* event_data)
@@ -134,103 +145,80 @@ static void fresh_control(bool state) {
     gpio_set_level(FRESH_GPIO_PIN, state ? 1 : 0);
 }
 
+static void fresh2_control(bool state) {
+    gpio_set_level(FRESH2_GPIO_PIN, state ? 1 : 0);
+}
 
-esp_err_t _http_event_handler(esp_http_client_event_t *evt) {
-    if (evt->event_id == HTTP_EVENT_ON_DATA) {
-        if (evt->data_len < sizeof(response_buffer) - 1) {
-            strncpy(response_buffer, (char*)evt->data, evt->data_len);
-            response_buffer[evt->data_len] = 0; // Завершаем строку нулевым символом
-            response_received = true;
-        }
+
+static esp_err_t _http_event_handler(esp_http_client_event_t *evt) {
+    http_task *task_data = (http_task *) evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len < sizeof(task_data->response_buffer) - 1) {
+        strncpy(task_data->response_buffer, (char*)evt->data, evt->data_len);
+        task_data->response_buffer[evt->data_len] = 0; // Завершаем строку
+        task_data->response_received = true;
     }
     return ESP_OK;
 }
 
-static void get_fan_status_from_server(void *pvParameters) {
-    char url_buffer[FULL_URL_SIZE];  // Создаем отдельный буфер для полного URL
-
-    // Формируем полный URL для запроса состояния реле
-    snprintf(url_buffer, sizeof(url_buffer), "%s/devices/fan", SERVER_URL);
+static void get_device_status_from_server(void *pvParameters) {
+    http_task *task_data = (http_task *) pvParameters;
     esp_http_client_config_t config = {
-        .url = url_buffer,
+        .url = task_data->url,
         .event_handler = _http_event_handler,
+        .user_data = task_data
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
 
     while (1) {
         esp_err_t err = esp_http_client_perform(client);
-        if (err == ESP_OK && response_received) {
-            ESP_LOGI(TAG, "Fan: Response: %s", response_buffer);
-            bool relay_state = strcmp(response_buffer, "1") == 0;
-            fan_control(relay_state);
+        if (err == ESP_OK && task_data->response_received) {
+            ESP_LOGI(TAG, "Response from %s: %s", task_data->url, task_data->response_buffer);
+            bool relay_state = strcmp(task_data->response_buffer, "1") == 0;
+
+            // Управляем устройствами на основе URL и состояния
+            if (strstr(task_data->url, "fan") != NULL && !limit_status) fan_control(relay_state);
+            else if (strstr(task_data->url, "humidifier") != NULL && !limit_status) humid_control(relay_state);
+            else if (strstr(task_data->url, "freshener") != NULL && !limit_status) {
+                fresh_control(relay_state);
+                if (relay_state) freshener_timer();
+            }
+            else if (strstr(task_data->url, "freshener2") != NULL && !limit_status) {
+                fresh2_control(relay_state);
+                if (relay_state) freshener_timer();
+            }
+            
         } else {
-            ESP_LOGE(TAG, "Fan: HTTP GET request failed: %s", esp_err_to_name(err));
+            ESP_LOGE(TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
         }
-        
-        response_received = false;
-        memset(response_buffer, 0, sizeof(response_buffer)); // Очистка буфера
+
+        task_data->response_received = false;
+        memset(task_data->response_buffer, 0, sizeof(task_data->response_buffer));
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 
     esp_http_client_cleanup(client);
 }
 
-static void get_humid_status_from_server(void *pvParameters) {
-    char url_buffer[FULL_URL_SIZE];  // Создаем отдельный буфер для полного URL
-
-    // Формируем полный URL для запроса состояния реле
-    snprintf(url_buffer, sizeof(url_buffer), "%s/devices/humidifier", SERVER_URL);
-    esp_http_client_config_t config = {
-        .url = url_buffer,
-        .event_handler = _http_event_handler,
+void init_limit_switch() {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << LIMIT_SWITCH_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,  
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, 
+        .intr_type = GPIO_INTR_DISABLE
     };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-
-    while (1) {
-        esp_err_t err = esp_http_client_perform(client);
-        if (err == ESP_OK && response_received) {
-            ESP_LOGI(TAG, "Humid: Response: %s", response_buffer);
-            bool relay_state = strcmp(response_buffer, "1") == 0;
-            humid_control(relay_state);
-        } else {
-            ESP_LOGE(TAG, "Humid: HTTP GET request failed: %s", esp_err_to_name(err));
-        }
-        
-        response_received = false;
-        memset(response_buffer, 0, sizeof(response_buffer)); // Очистка буфера
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
-
-    esp_http_client_cleanup(client);
+    gpio_config(&io_conf);
 }
 
-static void get_fresh_status_from_server(void *pvParameters) {
-    char url_buffer[FULL_URL_SIZE];  // Создаем отдельный буфер для полного URL
-
-    // Формируем полный URL для запроса состояния реле
-    snprintf(url_buffer, sizeof(url_buffer), "%s/devices/freshener", SERVER_URL);
-    esp_http_client_config_t config = {
-        .url = url_buffer,
-        .event_handler = _http_event_handler,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-
+static void read_limit_switch() {
     while (1) {
-        esp_err_t err = esp_http_client_perform(client);
-        if (err == ESP_OK && response_received) {
-            ESP_LOGI(TAG, "Fresh: Response: %s", response_buffer);
-            bool relay_state = strcmp(response_buffer, "1") == 0;
-            fresh_control(relay_state);
-        } else {
-            ESP_LOGE(TAG, "Fresh: HTTP GET request failed: %s", esp_err_to_name(err));
+        limit_status = gpio_get_level(LIMIT_SWITCH_PIN);
+        if (!limit_status) {
+            fresh_control(false);
+            fan_control(false);
+            humid_control(false);
         }
-        
-        response_received = false;
-        memset(response_buffer, 0, sizeof(response_buffer)); // Очистка буфера
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
-
-    esp_http_client_cleanup(client);
 }
 
 void app_main() {
@@ -238,6 +226,7 @@ void app_main() {
     esp_netif_init();
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     wifi_init_sta(); // Функция для инициализации Wi-Fi
+    init_limit_switch();
 
     esp_rom_gpio_pad_select_gpio(FAN_GPIO_PIN);
     gpio_set_direction(FAN_GPIO_PIN, GPIO_MODE_OUTPUT);
@@ -245,8 +234,18 @@ void app_main() {
     gpio_set_direction(HUMID_GPIO_PIN, GPIO_MODE_OUTPUT);
     esp_rom_gpio_pad_select_gpio(FRESH_GPIO_PIN);
     gpio_set_direction(FRESH_GPIO_PIN, GPIO_MODE_OUTPUT);
+    esp_rom_gpio_pad_select_gpio(FRESH_GPIO_PIN);
+    gpio_set_direction(FRESH2_GPIO_PIN, GPIO_MODE_OUTPUT);
 
-    xTaskCreate(&get_fan_status_from_server, "http_request_task", 8192, NULL, 5, NULL);
-    xTaskCreate(&get_humid_status_from_server, "http_request_task", 8192, NULL, 5, NULL);
-    xTaskCreate(&get_fresh_status_from_server, "http_request_task", 8192, NULL, 5, NULL);
+    static http_task fan_data = {.url = "http://192.168.1.46:9898/devices/fan"}; // изменить url
+    static http_task humid_data = {.url = "http://192.168.1.46:9898/devices/humidifier"};
+    static http_task fresh_data = {.url = "http://192.168.1.46:9898/devices/freshener"};
+    static http_task fresh2_data = {.url = "http://192.168.1.46:9898/devices/freshener2"};
+
+    xTaskCreate(&get_device_status_from_server, "fan_task", 4096, &fan_data, 5, NULL);
+    xTaskCreate(&get_device_status_from_server, "humid_task", 4096, &humid_data, 5, NULL);
+    xTaskCreate(&get_device_status_from_server, "fresh_task", 4096, &fresh_data, 5, NULL);
+    xTaskCreate(&get_device_status_from_server, "fresh2_task", 4096, &fresh2_data, 5, NULL);
+    xTaskCreate(&read_limit_switch, "monitor_limit_switch_task", 2048, NULL, 5, NULL);
+    xTaskCreate(&read_limit_switch, "monitor_limit_switch_task", 2048, NULL, 5, NULL);
 }
